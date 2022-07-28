@@ -56,13 +56,13 @@ import Control.Monad.Fail (MonadFail(fail))
 
 import Data.Array(Array,listArray)
 import Data.ByteString(ByteString)
-import qualified Data.ByteString as B(empty,useAsCString,last,take,drop,null)
-import qualified Data.ByteString.Unsafe as B(unsafeUseAsCString)
+import qualified Data.ByteString as B(empty,useAsCStringLen,last,take,drop,null)
+import qualified Data.ByteString.Unsafe as B(unsafeUseAsCStringLen)
 import System.IO.Unsafe(unsafePerformIO)
 import Text.Regex.Base.RegexLike(RegexMaker(..),RegexContext(..),RegexLike(..),MatchOffset,MatchLength)
 import Text.Regex.Posix.Wrap -- all
 import Text.Regex.Base.Impl(polymatch,polymatchM)
-import Foreign.C.String(CString)
+import Foreign.C.String(CStringLen)
 
 instance RegexContext Regex ByteString ByteString where
   match = polymatch
@@ -95,8 +95,7 @@ compile :: CompOption    -- ^ Flags (summed together)
         -> ExecOption    -- ^ Flags (summed together)
         -> ByteString  -- ^ The regular expression to compile
         -> IO (Either WrapError Regex)      -- ^ Returns: the compiled regular expression
-compile c e pattern =
-  asCString pattern (wrapCompile c e)
+compile c e pattern = asCString pattern (wrapCompile c e)
 
 
 -- ---------------------------------------------------------------------
@@ -145,7 +144,8 @@ unusedOffset = fromIntegral unusedRegOffset
 fi :: (Integral i,Num n) => i->n
 fi = fromIntegral
 
-asCString :: ByteString -> (CString -> IO a) -> IO a
+asCString :: ByteString -> (CStringLen -> IO a) -> IO a
 asCString bs = if (not (B.null bs)) && (0==B.last bs)
-                  then B.unsafeUseAsCString bs
-                  else B.useAsCString bs
+                  then B.unsafeUseAsCStringLen bs
+                  else B.useAsCStringLen bs
+

@@ -53,18 +53,19 @@ module Text.Regex.Posix.ByteString.Lazy(
   ) where
 
 import Prelude hiding (fail)
+import Control.Arrow (second)
 import Control.Monad.Fail (MonadFail(fail))
 
 import Data.Array(Array)
 import qualified Data.ByteString.Lazy as L (ByteString,null,toChunks,fromChunks,last,snoc)
 import qualified Data.ByteString as B(ByteString,concat)
-import qualified Data.ByteString.Unsafe as B(unsafeUseAsCString)
+import qualified Data.ByteString.Unsafe as B(unsafeUseAsCStringLen)
 import System.IO.Unsafe(unsafePerformIO)
 import Text.Regex.Base.RegexLike(RegexMaker(..),RegexContext(..),RegexLike(..),MatchOffset,MatchLength)
 import Text.Regex.Posix.Wrap -- all
 import qualified Text.Regex.Posix.ByteString as BS(execute,regexec)
 import Text.Regex.Base.Impl(polymatch,polymatchM)
-import Foreign.C.String(CString)
+import Foreign.C.String(CStringLen)
 
 instance RegexContext Regex L.ByteString L.ByteString where
   match = polymatch
@@ -81,10 +82,14 @@ unwrap x = case x of Left err -> fail ("Text.Regex.Posix.ByteString.Lazy died: "
                      Right v -> return v
 
 {-# INLINE asCString #-}
-asCString :: L.ByteString -> (CString -> IO a) -> IO a
-asCString s = if (not (L.null s)) && (0==L.last s)
-                then B.unsafeUseAsCString (fromLazy s)
-                else B.unsafeUseAsCString (fromLazy (L.snoc s 0))
+asCString :: L.ByteString -> (CStringLen -> IO a) -> IO a
+asCString s f = if (not (L.null s)) && (0==L.last s)
+  then B.unsafeUseAsCStringLen (fromLazy s) f
+  else B.unsafeUseAsCStringLen (fromLazy (L.snoc s 0)) $
+         -- Remove the added nul from the converted buffer's length.
+         -- The regexec functions do accept non-null-terminated strings now,
+         -- but regcomp requires a null-terminated string for the pattern.
+         \(cstr,len) -> f (cstr, pred len)
 
 instance RegexMaker Regex CompOption ExecOption L.ByteString where
   makeRegexOpts c e pattern = unsafePerformIO $ compile c e pattern >>= unwrap

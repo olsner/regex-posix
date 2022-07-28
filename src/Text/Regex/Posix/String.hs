@@ -53,7 +53,7 @@ import Control.Monad.Fail (MonadFail(fail))
 
 import Data.Array(listArray, Array)
 import Data.List(genericDrop, genericTake)
-import Foreign.C.String(withCAString)
+import Foreign.C.String(withCAStringLen)
 import System.IO.Unsafe(unsafePerformIO)
 import Text.Regex.Base.RegexLike(RegexContext(..),RegexMaker(..),RegexLike(..),MatchOffset,MatchLength)
 import Text.Regex.Posix.Wrap
@@ -78,20 +78,20 @@ instance RegexMaker Regex CompOption ExecOption String where
 
 instance RegexLike Regex String where
   matchTest regex str = unsafePerformIO $ do
-    withCAString str (wrapTest regex) >>= unwrap
+    withCAStringLen str (wrapTest regex) >>= unwrap
   matchOnce regex str = unsafePerformIO $
     execute regex str >>= unwrap
   matchAll regex str = unsafePerformIO $
-    withCAString str (wrapMatchAll regex) >>= unwrap
+    withCAStringLen str (wrapMatchAll regex) >>= unwrap
   matchCount regex str = unsafePerformIO $
-    withCAString str (wrapCount regex) >>= unwrap
+    withCAStringLen str (wrapCount regex) >>= unwrap
 
 -- compile
 compile  :: CompOption -- ^ Flags (summed together)
          -> ExecOption -- ^ Flags (summed together)
          -> String     -- ^ The regular expression to compile (ASCII only, no null bytes)
          -> IO (Either WrapError Regex) -- ^ Returns: the compiled regular expression
-compile flags e pattern =  withCAString pattern (wrapCompile flags e)
+compile flags e pattern =  withCAStringLen pattern (wrapCompile flags e)
 
 -- -----------------------------------------------------------------------------
 -- regexec
@@ -107,7 +107,7 @@ execute :: Regex      -- ^ Compiled regular expression
                 --   'Just' (array of offset length pairs)
                 -- @
 execute regex str = do
-  maybeStartEnd <- withCAString str (wrapMatch regex)
+  maybeStartEnd <- withCAStringLen str (wrapMatch regex)
   case maybeStartEnd of
     Right Nothing -> return (Right Nothing)
 --  Right (Just []) ->  fail "got [] back!" -- return wierd array instead
@@ -143,7 +143,7 @@ regexec regex str = do
         ,getSub matchedStartStop
         ,genericDrop stop str
         ,map getSub subStartStop)
-  maybeStartEnd <- withCAString str (wrapMatch regex)
+  maybeStartEnd <- withCAStringLen str (wrapMatch regex)
   case maybeStartEnd of
     Right Nothing -> return (Right Nothing)
     Right (Just parts) -> return . Right . Just . matchedParts $ parts

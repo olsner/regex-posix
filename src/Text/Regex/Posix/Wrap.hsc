@@ -107,7 +107,8 @@ import Data.Int(Int32,Int64)   -- need whatever RegeOffset or #regoff_t type wil
 import Data.Word(Word32,Word64) -- need whatever RegeOffset or #regoff_t type will be
 import Foreign(Ptr, FunPtr, nullPtr, newForeignPtr,
                addForeignPtrFinalizer, Storable(peekByteOff), allocaArray,
-               allocaBytes, withForeignPtr,ForeignPtr,plusPtr,peekElemOff)
+               allocaBytes, withForeignPtr,ForeignPtr,plusPtr,peekElemOff,
+               pokeByteOff)
 import Foreign.Marshal.Alloc(mallocBytes)
 import Foreign.C(CChar)
 #if __GLASGOW_HASKELL__ >= 703
@@ -115,7 +116,7 @@ import Foreign.C(CSize(CSize),CInt(CInt))
 #else
 import Foreign.C(CSize,CInt)
 #endif
-import Foreign.C.String(peekCAString, CString)
+import Foreign.C.String(peekCAString, CString, CStringLen)
 import Text.Regex.Base.RegexLike(RegexOptions(..),RegexMaker(..),RegexContext(..),MatchArray)
 -- deprecated: import qualified System.IO.Error as IOERROR(try)
 import qualified Control.Exception(try,IOException)
@@ -232,24 +233,27 @@ type WrapError = (ReturnCode,String)
 
 wrapCompile :: CompOption -- ^ Flags (bitmapped)
             -> ExecOption -- ^ Flags (bitmapped)
-            -> CString -- ^ The regular expression to compile (ASCII only, no null bytes)
+            -> CStringLen -- ^ The regular expression to compile (ASCII only, no null bytes)
             -> IO (Either WrapError Regex) -- ^ Returns: the compiled regular expression
 
-wrapTest :: Regex -> CString
+wrapTest :: Regex -> CStringLen
          -> IO (Either WrapError Bool)
+wrapTest' :: Regex -> CString -> Int
+          -> IO (Either WrapError Bool)
+
 
 -- | 'wrapMatch' returns offsets for the begin and end of each capture.
 -- Unused captures have offsets of 'unusedRegOffset' which is (-1).
-wrapMatch :: Regex -> CString
+wrapMatch :: Regex -> CStringLen
           -> IO (Either WrapError (Maybe [(RegOffset,RegOffset)]))
 
 -- | 'wrapMatchAll' returns the offset and length of each capture.
 -- Unused captures have an offset of 'unusedRegOffset' which is (-1) and
 -- length of 0.
-wrapMatchAll :: Regex -> CString
+wrapMatchAll :: Regex -> CStringLen
              -> IO (Either WrapError [MatchArray])
 
-wrapCount :: Regex -> CString
+wrapCount :: Regex -> CStringLen
           -> IO (Either WrapError Int)
 
 (=~)  :: (RegexMaker Regex CompOption ExecOption source,RegexContext Regex source1 target)
@@ -310,7 +314,11 @@ retOk = ReturnCode 0
 -- Flags for regexec
 #enum ExecOption,ExecOption, \
   execNotBOL = REG_NOTBOL, \
-  execNotEOL = REG_NOTEOL
+  execNotEOL = REG_NOTEOL, \
+  execStartEnd = REG_STARTEND
+-- TODO: REG_STARTEND is not strictly standard, but required to support
+-- embedded NULs. See if we need some ifdef hellery or e.g. a fallback that
+-- errors out on nuls in input when built on a system that lacks it.
 
 -- Flags for regcomp
 #enum CompOption,CompOption, \
@@ -346,11 +354,25 @@ nullTest ptr msg io = do
     then return (Left (retOk,"Ptr parameter was nullPtr in Text.Regex.TRE.Wrap."++msg))
     else io
 
-isNewline,isNull :: Ptr CChar -> Int -> IO Bool
+isNewline :: Ptr CChar -> Int -> IO Bool
 isNewline cstr pos = liftM (newline ==) (peekElemOff cstr pos)
   where newline = toEnum 10
-isNull cstr pos = liftM (nullChar ==) (peekElemOff cstr pos)
-  where nullChar = toEnum 0
+
+allocaMatch :: CSize -> String -> (Ptr CRegMatch -> IO (Either WrapError a))
+               -> IO (Either WrapError a)
+allocaMatch nsub msg fun =
+  allocaBytes nsub_bytes $ \p_match ->
+    nullTest p_match (msg ++ " allocaBytes") (fun p_match)
+  where
+    nsub_int,nsub_bytes :: Int
+    nsub_int = fromIntegral nsub
+    -- add one because index zero covers the whole match
+    nsub_bytes = (1 + nsub_int) * (#const sizeof(regmatch_t))
+
+pokeStartEnd :: (Show a, Integral a) => Ptr CRegMatch -> a -> a -> IO ()
+pokeStartEnd p_match start end = do
+  (#poke regmatch_t, rm_so) p_match (fromIntegral start :: RegOffsetT)
+  (#poke regmatch_t, rm_eo) p_match (fromIntegral end :: RegOffsetT)
 
 {-
 wrapRC :: ReturnCode -> IO (Either WrapError b)
@@ -369,7 +391,7 @@ wrapError errCode regex_ptr = do
     return (Left (errCode, msg))
 
 ----------
-wrapCompile flags e pattern = do
+wrapCompile flags e (pattern, _len) = do
  nullTest pattern "wrapCompile pattern" $ do
   e_regex_ptr <- try $ mallocBytes (#const sizeof(regex_t)) -- ioError called if nullPtr
   case e_regex_ptr of
@@ -384,22 +406,26 @@ wrapCompile flags e pattern = do
           else wrapError errCode regex_ptr
 
 ---------
-wrapTest (Regex regex_fptr _ flags) cstr = do
+wrapTest regex (cstr, len) = wrapTest' regex cstr len
+
+wrapTest' (Regex regex_fptr _ flags) cstr len = do
  nullTest cstr "wrapTest" $ do
   withForeignPtr regex_fptr $ \regex_ptr -> do
-    r <- c_regexec regex_ptr cstr 0 nullPtr flags
-    if r == retOk
-      then return (Right True)
-      else if r == retNoMatch
-              then return (Right False)
-              else wrapError r regex_ptr
+    allocaMatch 0 "wrapTest" $ \p_match -> do
+      pokeStartEnd p_match 0 len
+      r <- c_regexec regex_ptr cstr 0 p_match (flags .|. execStartEnd)
+      if r == retOk
+        then return (Right True)
+        else if r == retNoMatch
+                then return (Right False)
+                else wrapError r regex_ptr
 
 ---------
-wrapMatch regex@(Regex regex_fptr compileOptions flags) cstr = do
+wrapMatch regex@(Regex regex_fptr compileOptions flags) (cstr, len) = do
  nullTest cstr "wrapMatch cstr" $ do
   if (0 /= compNoSub .&. compileOptions)
     then do
-      r <- wrapTest regex cstr
+      r <- wrapTest' regex cstr len
       case r of
         Right True -> return (Right (Just [])) -- Source of much "wtf?" crap
         Right False -> return (Right Nothing)
@@ -407,13 +433,9 @@ wrapMatch regex@(Regex regex_fptr compileOptions flags) cstr = do
     else do
       withForeignPtr regex_fptr $ \regex_ptr -> do
         nsub <- (#peek regex_t, re_nsub) regex_ptr :: IO CSize
-        let nsub_int,nsub_bytes :: Int
-            nsub_int = fromIntegral nsub
-            nsub_bytes = ((1 + nsub_int) * (#const sizeof(regmatch_t)))
-        -- add one because index zero covers the whole match
-        allocaBytes nsub_bytes $ \p_match -> do
-         nullTest p_match "wrapMatch allocaBytes" $ do
-          doMatch regex_ptr cstr nsub p_match flags
+        allocaMatch nsub "wrapMatch" $ \p_match -> do
+          pokeStartEnd p_match 0 len
+          doMatch regex_ptr cstr nsub p_match (flags .|. execStartEnd)
 
 -- Very very thin wrapper
 -- Requires, but does not check, that nsub>=0
@@ -439,11 +461,11 @@ doMatch regex_ptr cstr nsub p_match flags = do
       end   <- (#peek regmatch_t, rm_eo) pmatch' :: IO (#type regoff_t)
       return (fromIntegral start,fromIntegral end)
 
-wrapMatchAll regex@(Regex regex_fptr compileOptions flags) cstr = do
+wrapMatchAll regex@(Regex regex_fptr compileOptions flags) (cstr, len) = do
  nullTest cstr "wrapMatchAll cstr" $ do
   if (0 /= compNoSub .&. compileOptions)
     then do
-      r <- wrapTest regex cstr
+      r <- wrapTest' regex cstr len
       case r of
         Right True -> return (Right [(toMA 0 [])]) -- Source of much "wtf?" crap
         Right False -> return (Right [])
@@ -451,33 +473,30 @@ wrapMatchAll regex@(Regex regex_fptr compileOptions flags) cstr = do
     else do
       withForeignPtr regex_fptr $ \regex_ptr -> do
         nsub <- (#peek regex_t, re_nsub) regex_ptr :: IO CSize
-        let nsub_int,nsub_bytes :: Int
-            nsub_int = fromIntegral nsub
-            nsub_bytes = ((1 + nsub_int) * (#const sizeof(regmatch_t)))
-        -- add one because index zero covers the whole match
-        allocaBytes nsub_bytes $ \p_match -> do
-         nullTest p_match "wrapMatchAll p_match" $ do
-          let flagsBOL = (complement execNotBOL) .&. flags
-              flagsMIDDLE = execNotBOL .|. flags
-              atBOL pos = doMatch regex_ptr (plusPtr cstr pos) nsub p_match flagsBOL
-              atMIDDLE pos = doMatch regex_ptr (plusPtr cstr pos) nsub p_match flagsMIDDLE
+        allocaMatch nsub "wrapMatchAll" $ \p_match -> do
+          let flags' = flags .|. execStartEnd
+              flagsBOL = (complement execNotBOL) .&. flags'
+              flagsMIDDLE = execNotBOL .|. flags'
+              atBOL = doMatch regex_ptr cstr nsub p_match flagsBOL
+              atMIDDLE = doMatch regex_ptr cstr nsub p_match flagsMIDDLE
               loop acc old (s,e) | acc `seq` old `seq` False = undefined
                                  | s == e = do
-                let pos = old + fromIntegral e -- pos may be 0
-                atEnd <- isNull cstr pos
-                if atEnd then return (Right (acc []))
+                let pos = fromIntegral e -- pos may be 0
+                if pos >= len then return (Right (acc []))
                   else loop acc old (s,succ e)
                                  | otherwise = do
-                let pos = old + fromIntegral e -- pos must be greater than 0 (tricky but true)
+                let pos = fromIntegral e -- pos must be greater than 0 (tricky but true)
                 prev'newline <- isNewline cstr (pred pos) -- safe
-                result <- if prev'newline then atBOL pos else atMIDDLE pos
+                pokeStartEnd p_match pos len
+                result <- if prev'newline then atBOL else atMIDDLE
                 case result of
                   Right Nothing -> return (Right (acc []))
-                  Right (Just parts@(whole:_)) -> let ma = toMA pos parts
+                  Right (Just parts@(whole:_)) -> let ma = toMA 0 parts
                                                  in loop (acc.(ma:)) pos whole
                   Left err -> return (Left err)
-                  Right (Just []) -> return (Right (acc [(toMA pos [])])) -- should never happen
-          result <- doMatch regex_ptr cstr nsub p_match flags
+                  Right (Just []) -> return (Right (acc [(toMA 0 [])])) -- should never happen
+          pokeStartEnd p_match 0 len
+          result <- doMatch regex_ptr cstr nsub p_match flags'
           case result of
             Right Nothing -> return (Right [])
             Right (Just parts@(whole:_)) -> let ma = toMA 0 parts
@@ -492,11 +511,11 @@ wrapMatchAll regex@(Regex regex_fptr compileOptions flags) cstr = do
       $ parts
 
 ---------
-wrapCount regex@(Regex regex_fptr compileOptions flags) cstr = do
+wrapCount regex@(Regex regex_fptr compileOptions flags) (cstr, len) = do
  nullTest cstr "wrapCount cstr" $ do
   if (0 /= compNoSub .&. compileOptions)
     then do
-      r <- wrapTest regex cstr
+      r <- wrapTest' regex cstr len
       case r of
         Right True -> return (Right 1)
         Right False -> return (Right 0)
@@ -506,26 +525,28 @@ wrapCount regex@(Regex regex_fptr compileOptions flags) cstr = do
         let nsub_bytes = (#size regmatch_t)
         allocaBytes nsub_bytes $ \p_match -> do
          nullTest p_match "wrapCount p_match" $ do
-          let flagsBOL = (complement execNotBOL) .&. flags
-              flagsMIDDLE = execNotBOL .|. flags
-              atBOL pos = doMatch regex_ptr (plusPtr cstr pos) 0 p_match flagsBOL
-              atMIDDLE pos = doMatch regex_ptr (plusPtr cstr pos) 0 p_match flagsMIDDLE
+          let flags' = flags .|. execStartEnd
+              flagsBOL = (complement execNotBOL) .&. flags'
+              flagsMIDDLE = execNotBOL .|. flags'
+              atBOL = doMatch regex_ptr cstr 0 p_match flagsBOL
+              atMIDDLE = doMatch regex_ptr cstr 0 p_match flagsMIDDLE
               loop acc old (s,e) | acc `seq` old `seq` False = undefined
                                  | s == e = do
-                let pos = old + fromIntegral e -- 0 <= pos
-                atEnd <- isNull cstr pos
-                if atEnd then return (Right acc)
+                let pos = fromIntegral e -- 0 <= pos
+                if pos == len then return (Right acc)
                   else loop acc old (s,succ e)
                                  | otherwise = do
-                let pos = old + fromIntegral e -- 0 < pos
+                let pos = fromIntegral e -- 0 < pos
                 prev'newline <- isNewline cstr (pred pos) -- safe
-                result <- if prev'newline then atBOL pos else atMIDDLE pos
+                pokeStartEnd p_match pos len
+                result <- if prev'newline then atBOL else atMIDDLE
                 case result of
                   Right Nothing -> return (Right acc)
                   Right (Just (whole:_)) -> loop (succ acc) pos whole
                   Left err -> return (Left err)
                   Right (Just []) -> return (Right acc) -- should never happen
-          result <- doMatch regex_ptr cstr 0 p_match flags
+          pokeStartEnd p_match 0 len
+          result <- doMatch regex_ptr cstr 0 p_match flags'
           case result of
             Right Nothing -> return (Right 0)
             Right (Just (whole:_)) -> loop 1 0 whole

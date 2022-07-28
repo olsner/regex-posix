@@ -155,14 +155,10 @@ regexec regex str = do
     Right (Just parts) -> return . Right . Just . matchedParts $ parts
     Left err -> return (Left err)
 
-withSeq :: Seq Char -> (CString -> IO a) -> IO a
+withSeq :: Seq Char -> (CStringLen -> IO a) -> IO a
 withSeq s f =
-  let -- Ensure null at end of s
-      s' = case viewr s of                 -- bang !s
-             EmptyR -> singleton '\0'
-             _ :> '\0' -> s
-             _ -> s |> '\0'
-      pokes p a = case viewl a of         -- bang pokes !p !a
-                    EmptyL -> return ()
-                    c :< a' -> poke p (castCharToCChar c) >> pokes (advancePtr p 1) a'
-  in allocaBytes (S.length s') (\ptr -> pokes ptr s' >> f ptr)
+  let pokes p a = case viewl a of         -- bang pokes !p !a
+        EmptyL -> poke p 0    -- Add null at end of s. (Maybe redundantly.)
+        c :< a' -> poke p (castCharToCChar c) >> pokes (advancePtr p 1) a'
+      len = S.length s
+  in allocaBytes (succ len) (\ptr -> pokes ptr s >> f (ptr, len))
